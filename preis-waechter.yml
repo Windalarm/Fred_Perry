@@ -5,6 +5,11 @@ on:
     # 3x täglich (UTC): 7, 15 und 23 Uhr deutscher Winterzeit
     - cron: "0 6,14,22 * * *"
   workflow_dispatch:
+    inputs:
+      testmail:
+        description: "Testmail verschicken?"
+        type: boolean
+        default: false
 
 jobs:
   check:
@@ -35,3 +40,4 @@ jobs:
           GMAIL_ADRESSE: ${{ secrets.GMAIL_ADRESSE }}
           GMAIL_APP_PASSWORT: ${{ secrets.GMAIL_APP_PASSWORT }}
           EMPFAENGER: ${{ secrets.EMPFAENGER }}
+          TESTMAIL: ${{ inputs.testmail }}
