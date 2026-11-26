@@ -1,8 +1,14 @@
 """
 Fred Perry Preis-Wächter
-Durchsucht Google Shopping (über SerpApi) nach Fred Perry Poloshirts
-und schickt eine E-Mail (und optional eine SMS), sobald ein Angebot
-unter dem Maximalpreis auftaucht. Jedes Angebot wird nur einmal gemeldet.
+Durchsucht Google Shopping Deutschland (über SerpApi) nach Fred Perry
+Poloshirts und schickt eine E-Mail, sobald ein Angebot unter dem
+Maximalpreis auftaucht. Jedes Angebot wird nur einmal gemeldet.
+
+Benötigte GitHub-Secrets:
+  SERPAPI_KEY         - API-Schlüssel von serpapi.com
+  GMAIL_ADRESSE       - Gmail-Adresse, von der verschickt wird
+  GMAIL_APP_PASSWORT  - App-Passwort dieser Gmail-Adresse
+  EMPFAENGER          - E-Mail-Adresse, die die Info bekommt
 """
 
 import json
@@ -15,8 +21,8 @@ from pathlib import Path
 import requests
 
 # ---------------- Einstellungen ----------------
-SUCHBEGRIFF = os.getenv("SUCHBEGRIFF", "Fred Perry Polo Shirt Herren")
-MAX_PREIS = float(os.getenv("MAX_PREIS", "60"))
+SUCHBEGRIFF = "Fred Perry Polo Shirt Herren"
+MAX_PREIS = 60.0
 
 # Diese Wörter MÜSSEN im Titel vorkommen
 PFLICHT_WOERTER = ["fred perry", "polo"]
@@ -27,35 +33,41 @@ GESEHEN_DATEI = Path("gesehene_angebote.json")
 # ------------------------------------------------
 
 
-def suche_angebote():
-    """Holt Angebote aus Google Shopping Deutschland über SerpApi."""
+def secret(name):
+    """Liest ein Secret und gibt eine verständliche Meldung, falls es fehlt."""
+    wert = (os.getenv(name) or "").strip()
+    if not wert:
+        print(f"FEHLER: Das Secret '{name}' fehlt oder ist leer. "
+              f"Bitte unter Settings -> Secrets and variables -> Actions anlegen.")
+        sys.exit(1)
+    return wert
+
+
+def suche_angebote(api_key):
     params = {
         "engine": "google_shopping",
         "q": SUCHBEGRIFF,
         "gl": "de",
         "hl": "de",
         "google_domain": "google.de",
-        "api_key": os.environ["SERPAPI_KEY"],
+        "api_key": api_key,
     }
     antwort = requests.get("https://serpapi.com/search.json", params=params, timeout=60)
-    antwort.raise_for_status()
     daten = antwort.json()
-
     if "error" in daten:
-        raise RuntimeError(f"SerpApi-Fehler: {daten['error']}")
-
+        print(f"FEHLER von SerpApi: {daten['error']}")
+        sys.exit(1)
     return daten.get("shopping_results", []) + daten.get("inline_shopping_results", [])
 
 
 def ist_passend(angebot):
     titel = (angebot.get("title") or "").lower()
     preis = angebot.get("extracted_price")
-
     if preis is None or preis >= MAX_PREIS:
         return False
-    if not all(wort in titel for wort in PFLICHT_WOERTER):
+    if not all(w in titel for w in PFLICHT_WOERTER):
         return False
-    if any(wort in titel for wort in AUSSCHLUSS_WOERTER):
+    if any(w in titel for w in AUSSCHLUSS_WOERTER):
         return False
     if angebot.get("second_hand_condition"):
         return False
@@ -63,13 +75,15 @@ def ist_passend(angebot):
 
 
 def angebot_id(angebot):
-    # Gleicher Artikel beim gleichen Shop mit neuem Preis wird erneut gemeldet
     return f"{angebot.get('title')}|{angebot.get('source')}|{angebot.get('extracted_price')}"
 
 
 def lade_gesehene():
     if GESEHEN_DATEI.exists():
-        return set(json.loads(GESEHEN_DATEI.read_text(encoding="utf-8")))
+        try:
+            return set(json.loads(GESEHEN_DATEI.read_text(encoding="utf-8")))
+        except Exception:
+            return set()
     return set()
 
 
@@ -77,7 +91,44 @@ def speichere_gesehene(ids):
     GESEHEN_DATEI.write_text(json.dumps(sorted(ids), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def sende_mail(angebote):
+def mail_verschicken(betreff, text, absender, passwort, empfaenger):
+    msg = EmailMessage()
+    msg["Subject"] = betreff
+    msg["From"] = absender
+    msg["To"] = empfaenger
+    msg.set_content(text)
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(absender, passwort)
+            smtp.send_message(msg)
+    except smtplib.SMTPAuthenticationError:
+        print("FEHLER: Gmail hat die Anmeldung abgelehnt. Prüfe GMAIL_ADRESSE und "
+              "GMAIL_APP_PASSWORT (muss ein App-Passwort sein, nicht dein normales Passwort).")
+        sys.exit(1)
+    print(f"E-Mail an {empfaenger} verschickt: {betreff}")
+
+
+def angebots_zeilen(angebote):
+    zeilen = []
+    for a in angebote:
+        link = a.get("link") or a.get("product_link") or ""
+        zeilen.append(f"• {a.get('title')}\n  {a.get('price')} bei {a.get('source')}\n  {link}\n")
+    return zeilen
+
+
+def sende_testmail(alle, absender, passwort, empfaenger):
+    fp = [a for a in alle
+          if "fred perry" in (a.get("title") or "").lower() and a.get("extracted_price") is not None]
+    fp.sort(key=lambda a: a["extracted_price"])
+    zeilen = ["Das ist eine Testmail von deinem Fred Perry Preis-Wächter. Der Mailversand funktioniert! 🎉\n",
+              f"Aktuell gefunden: {len(alle)} Ergebnisse, davon {len(fp)} von Fred Perry.",
+              f"Gemeldet wird automatisch alles unter {MAX_PREIS:.0f} €.\n",
+              "Die 5 günstigsten Fred Perry Angebote gerade (egal welcher Preis):\n"]
+    zeilen += angebots_zeilen(fp[:5]) or ["(keine gefunden)"]
+    mail_verschicken("Testmail: Fred Perry Preis-Wächter", "\n".join(zeilen), absender, passwort, empfaenger)
+
+
+def sende_mail(angebote, absender, passwort, empfaenger):
     zeilen = [f"Es gibt {len(angebote)} neue Fred Perry Polo-Angebote unter {MAX_PREIS:.0f} €:\n"]
     for a in angebote:
         link = a.get("link") or a.get("product_link") or ""
@@ -85,62 +136,38 @@ def sende_mail(angebote):
     zeilen.append("Tipp: Bei sehr günstigen Preisen von unbekannten Shops auf Fake-Shops achten "
                   "(Impressum, Bewertungen, keine Vorkasse).")
 
-    msg = EmailMessage()
-    msg["Subject"] = f"👕 Fred Perry Polo unter {MAX_PREIS:.0f} € gefunden!"
-    msg["From"] = os.environ["SMTP_USER"]
-    msg["To"] = os.environ["MAIL_AN"]
-    msg.set_content("\n".join(zeilen))
-
-    server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-    port = int(os.getenv("SMTP_PORT", "465"))
-    with smtplib.SMTP_SSL(server, port) as smtp:
-        smtp.login(os.environ["SMTP_USER"], os.environ["SMTP_PASSWORT"])
-        smtp.send_message(msg)
-    print("E-Mail verschickt.")
-
-
-def sende_sms(angebote):
-    """Optional: SMS über Twilio, nur wenn die Twilio-Secrets gesetzt sind."""
-    sid = os.getenv("TWILIO_SID")
-    token = os.getenv("TWILIO_TOKEN")
-    von = os.getenv("TWILIO_VON")
-    an = os.getenv("SMS_AN")
-    if not all([sid, token, von, an]):
-        return
-
-    guenstigstes = min(angebote, key=lambda a: a["extracted_price"])
-    text = (f"Fred Perry Polo ab {guenstigstes.get('price')} bei {guenstigstes.get('source')}. "
-            f"{len(angebote)} neue(s) Angebot(e) - Details per Mail.")
-
-    r = requests.post(
-        f"https://api.twilio.com/2010-04-01/Accounts/{sid}/Messages.json",
-        data={"From": von, "To": an, "Body": text},
-        auth=(sid, token),
-        timeout=30,
-    )
-    r.raise_for_status()
-    print("SMS verschickt.")
+    mail_verschicken(f"Fred Perry Polo unter {MAX_PREIS:.0f} € gefunden!", "\n".join(zeilen),
+                     absender, passwort, empfaenger)
 
 
 def main():
+    api_key = secret("SERPAPI_KEY")
+    absender = secret("GMAIL_ADRESSE")
+    passwort = secret("GMAIL_APP_PASSWORT").replace(" ", "")  # Leerzeichen aus App-Passwort entfernen
+    empfaenger = secret("EMPFAENGER")
+
     gesehene = lade_gesehene()
-    treffer = [a for a in suche_angebote() if ist_passend(a)]
+    alle = suche_angebote(api_key)
+    treffer = [a for a in alle if ist_passend(a)]
     neue = [a for a in treffer if angebot_id(a) not in gesehene]
 
-    print(f"{len(treffer)} passende Angebote, davon {len(neue)} neu.")
+    print(f"{len(alle)} Suchergebnisse insgesamt.")
+    print("Günstigste Ergebnisse:")
+    for a in sorted([a for a in alle if a.get("extracted_price") is not None],
+                    key=lambda a: a["extracted_price"])[:5]:
+        print(f"  {a.get('price')}  {a.get('title')}  ({a.get('source')})")
+    print(f"{len(treffer)} passende Angebote unter {MAX_PREIS:.0f} € gefunden, davon {len(neue)} neu.")
+
+    if os.getenv("TESTMAIL", "").lower() == "true":
+        sende_testmail(alle, absender, passwort, empfaenger)
 
     if neue:
         neue.sort(key=lambda a: a["extracted_price"])
-        sende_mail(neue)
-        sende_sms(neue)
+        sende_mail(neue, absender, passwort, empfaenger)
         gesehene.update(angebot_id(a) for a in neue)
 
     speichere_gesehene(gesehene)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"Fehler: {e}")
-        sys.exit(1)
+    main()
