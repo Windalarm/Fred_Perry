@@ -19,6 +19,8 @@ from email.message import EmailMessage
 from pathlib import Path
 
 import requests
+from requests.utils import requote_uri
+from urllib.parse import quote_plus
 
 # ---------------- Einstellungen ----------------
 SUCHBEGRIFF = "Fred Perry Polo Shirt Herren"
@@ -30,6 +32,10 @@ PFLICHT_WOERTER = ["fred perry", "polo"]
 AUSSCHLUSS_WOERTER = ["kinder", "kids", "junior", "baby", "gebraucht", "used", "pre-owned"]
 
 GESEHEN_DATEI = Path("gesehene_angebote.json")
+
+# Für so viele Angebote pro Mail wird der direkte Shop-Link abgefragt.
+# Jede Abfrage kostet eine zusätzliche SerpApi-Suche (100 frei pro Monat).
+MAX_DIREKTLINKS = 3
 # ------------------------------------------------
 
 
@@ -108,15 +114,57 @@ def mail_verschicken(betreff, text, absender, passwort, empfaenger):
     print(f"E-Mail an {empfaenger} verschickt: {betreff}")
 
 
-def angebots_zeilen(angebote):
+def shop_link_abfragen(angebot, api_key):
+    """Fragt bei SerpApi die Händlerliste des Produkts ab und sucht den direkten Shop-Link."""
+    token = angebot.get("immersive_product_page_token")
+    if not token:
+        return None
+    try:
+        r = requests.get("https://serpapi.com/search.json", timeout=60, params={
+            "engine": "google_immersive_product",
+            "page_token": token,
+            "gl": "de",
+            "hl": "de",
+            "api_key": api_key,
+        })
+        stores = r.json().get("product_results", {}).get("stores", [])
+    except Exception as e:
+        print(f"  Hinweis: Direkter Link für '{angebot.get('title')}' nicht abrufbar ({e})")
+        return None
+
+    shop = (angebot.get("source") or "").lower()
+    # Zuerst den Shop nehmen, der den gefundenen Preis anbietet
+    for st in stores:
+        if st.get("link") and shop and shop in (st.get("name") or "").lower():
+            return st["link"]
+    for st in stores:
+        if st.get("link"):
+            return st["link"]
+    return None
+
+
+def bester_link(angebot, api_key, direkt_erlaubt):
+    if direkt_erlaubt:
+        direkt = shop_link_abfragen(angebot, api_key)
+        if direkt:
+            return requote_uri(direkt)
+    if angebot.get("link"):
+        return requote_uri(angebot["link"])
+    if angebot.get("product_link"):
+        return requote_uri(angebot["product_link"])  # Leerzeichen werden zu %20
+    # Notlösung: Google-Suche nach Titel + Shop
+    return "https://www.google.de/search?q=" + quote_plus(f"{angebot.get('title')} {angebot.get('source')}")
+
+
+def angebots_zeilen(angebote, api_key):
     zeilen = []
-    for a in angebote:
-        link = a.get("link") or a.get("product_link") or ""
+    for i, a in enumerate(angebote):
+        link = bester_link(a, api_key, direkt_erlaubt=i < MAX_DIREKTLINKS)
         zeilen.append(f"• {a.get('title')}\n  {a.get('price')} bei {a.get('source')}\n  {link}\n")
     return zeilen
 
 
-def sende_testmail(alle, absender, passwort, empfaenger):
+def sende_testmail(alle, api_key, absender, passwort, empfaenger):
     fp = [a for a in alle
           if "fred perry" in (a.get("title") or "").lower() and a.get("extracted_price") is not None]
     fp.sort(key=lambda a: a["extracted_price"])
@@ -124,15 +172,13 @@ def sende_testmail(alle, absender, passwort, empfaenger):
               f"Aktuell gefunden: {len(alle)} Ergebnisse, davon {len(fp)} von Fred Perry.",
               f"Gemeldet wird automatisch alles unter {MAX_PREIS:.0f} €.\n",
               "Die 5 günstigsten Fred Perry Angebote gerade (egal welcher Preis):\n"]
-    zeilen += angebots_zeilen(fp[:5]) or ["(keine gefunden)"]
+    zeilen += angebots_zeilen(fp[:5], api_key) or ["(keine gefunden)"]
     mail_verschicken("Testmail: Fred Perry Preis-Wächter", "\n".join(zeilen), absender, passwort, empfaenger)
 
 
-def sende_mail(angebote, absender, passwort, empfaenger):
+def sende_mail(angebote, api_key, absender, passwort, empfaenger):
     zeilen = [f"Es gibt {len(angebote)} neue Fred Perry Polo-Angebote unter {MAX_PREIS:.0f} €:\n"]
-    for a in angebote:
-        link = a.get("link") or a.get("product_link") or ""
-        zeilen.append(f"• {a.get('title')}\n  {a.get('price')} bei {a.get('source')}\n  {link}\n")
+    zeilen += angebots_zeilen(angebote, api_key)
     zeilen.append("Tipp: Bei sehr günstigen Preisen von unbekannten Shops auf Fake-Shops achten "
                   "(Impressum, Bewertungen, keine Vorkasse).")
 
@@ -159,11 +205,11 @@ def main():
     print(f"{len(treffer)} passende Angebote unter {MAX_PREIS:.0f} € gefunden, davon {len(neue)} neu.")
 
     if os.getenv("TESTMAIL", "").lower() == "true":
-        sende_testmail(alle, absender, passwort, empfaenger)
+        sende_testmail(alle, api_key, absender, passwort, empfaenger)
 
     if neue:
         neue.sort(key=lambda a: a["extracted_price"])
-        sende_mail(neue, absender, passwort, empfaenger)
+        sende_mail(neue, api_key, absender, passwort, empfaenger)
         gesehene.update(angebot_id(a) for a in neue)
 
     speichere_gesehene(gesehene)
