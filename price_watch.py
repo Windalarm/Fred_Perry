@@ -24,7 +24,7 @@ from urllib.parse import quote_plus
 
 # ---------------- Einstellungen ----------------
 SUCHBEGRIFF = "Fred Perry Polo Shirt Herren"
-MAX_PREIS = 60.0
+MAX_PREIS = 76.0
 
 # Diese Wörter MÜSSEN im Titel vorkommen
 PFLICHT_WOERTER = ["fred perry", "polo"]
